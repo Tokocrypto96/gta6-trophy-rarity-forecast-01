@@ -1,55 +1,52 @@
-"""gta6-trophy-rarity-forecast-01: forecast each GTA VI trophy's Exophase earn rate
-at the case target (2026-11-26T00:00:00Z) as five quantiles (5/25/50/75/95%).
+"""GTA VI trophy earn-rate forecast (make.fun gta6-trophy-rarity-forecast-01).
 
-Method (per trophy, standard library only, offline, deterministic):
-  1. Take the case history (reads of Exophase's trophy page, oldest first).
-     Each read gives the trophy's earn rate (percent of tracked players) and
-     the players-tracked count.
-  2. Work in logit space: L = ln(p / (1 - p)), p = rate / 100, rate clamped
-     to [0.01, 99.99] before the logit (as the house baseline does).
-  3. Fit a straight line of L against LOG-TIME, x = ln(1 + hours since the
-     launch reference 2026-11-19T00:00:00Z), over the case's last 24 hours
-     of reads, by recency-weighted least squares (exponential weights,
-     half-life 8 h, so the fit follows the current direction, not the
-     launch-night average). Log-time is the right clock here: both the
-     player base's growth and players' progress decelerate, so a line in
-     log-time extrapolates a flattening curve, not a runaway one.
-  4. Read the line at the target's log-time for the median. Damp the move
-     from the last observed logit by 0.7: the future decelerates further
-     than the fit's window shows, and an undamped line overshoots.
-     Clamp the median rate to [0.01, 99.99].
-  5. Flat history (< 3 reads, or every rate identical): no trend to fit.
-     Fall back to the last rate (persistence). If the tracked-player count
-     is still small (< 10,000 -- launch night, before Exophase's first
-     refresh), apply a dilution prior: Exophase refreshes a game's counts
-     on its own schedule, and when it does the tracked-player count jumps
-     and every rate but a 100% one falls (RULES.txt: 638 -> 3,868 players
-     at the 04:30Z refresh on launch night, every rate lower). So for a
-     flat, early history, predict the median at 0.4x the last rate for
-     trophies below 99% (the 100% trophy stays ~99%). This only fires
-     when there is no trend signal at all; a real history overrides it.
-  6. Spread (logit units): random walk 0.5 * sqrt(horizon_days) (the house
-     baseline's term) combined in quadrature with the fit residual (how
-     well the line fits the last 24 h) and a trend-uncertainty term
-     0.3 * |damped logit move| (a big extrapolated move is an uncertain
-     one). Capped at 3.0 logit units. The quantiles are the median logit
-     plus z_tau * spread, mapped back to percent, rounded to 4 decimals
-     (half up, as the house baseline rounds).
+For each of the game's 55 PS5 trophies, forecast the Exophase earn rate
+(percent of tracked players) at the case's target instant -- the final
+case targets 2026-11-26T00:00:00Z, one week after launch -- as five
+quantiles (5%, 25%, 50%, 75%, 95%).
 
-The house baseline (persistence + random-walk spread) scores about 1.51
-pinball loss on the practice cases, because the refresh takes every rate
-outside its narrow 90-minute band. This model beats it by (a) following
-the trend where the history has one, instead of persisting a stale rate,
-and (b) anticipating the refresh dilution when the history is flat and
-early, instead of persisting a pre-refresh rate.
+The forecast is built per trophy, offline, with the standard library
+only, and is fully deterministic (no randomness, no dict-order
+dependence, sorted case files):
 
-Grader: `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0), python:3.13-slim,
-stdlib only, no network. Reads every <id>.in in the input directory and
-writes <id>.out to the output directory:
-  {"trophies": [{"id": 1, "q": [q05, q25, q50, q75, q95]}, ...]}
-one row per trophy, each q five finite numbers 0..100, non-decreasing.
-Outside the grader, MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR stand in for
-/input and /output.
+* Rates live in logit space, L = ln(p / (1 - p)), with the percent
+  clamped to [0.01, 99.99] first, exactly as the house baseline does.
+  On that scale a move from 1% to 2% counts about as much as a move
+  from 33% to 50%, which is also how the contest scores (pinball loss
+  on the logit scale).
+* The clock is log-time, x = ln(1 + hours since the launch reference
+  2026-11-19T00:00:00Z). Player growth and player progress both
+  decelerate after launch, so a straight line in log-time bends the
+  extrapolation down instead of letting it run away.
+* Trend: a recency-weighted least-squares line of L against x over
+  the last 24 hours of reads, weights decaying with an 8-hour
+  half-life, so the fit tracks the current direction rather than the
+  launch-night average. The median is the last observed logit plus
+  the line's move to the target, damped by 0.7 -- the future slows
+  down further than the fit window shows.
+* Flat history: with fewer than 3 reads, or every rate identical,
+  there is no trend to fit, so the median persists the last rate.
+  But if the tracked-player count is still under 10,000, the page
+  is pre-refresh: Exophase refreshes a game's counts on its own
+  schedule, and when it does, the player count jumps and every rate
+  except a 100% one falls (launch night: 638 -> 3,868 players at the
+  04:30Z refresh, every rate lower). So a flat, early history gets a
+  dilution prior: median 0.4x the last rate for trophies below 99%.
+  A real (non-flat) history overrides this prior.
+* Spread, in logit units: the house baseline's random walk,
+  0.5 * sqrt(horizon in days), combined in quadrature with the
+  trend fit's residual and 0.3 * |damped logit move| (a large
+  extrapolated move is an uncertain one), capped at 3.0. The
+  quantiles are median_logit + z_tau * spread, mapped back to
+  percent and rounded to 4 decimals, half up, as the house baseline
+  rounds; a final pass enforces non-decreasing order after rounding.
+
+The grader runs `python3 -P -s /bot/main.py` (python:3.13-slim,
+stdlib only, no network), one case per run, reading every <id>.in
+in the input directory and writing <id>.out to the output directory:
+{"trophies": [{"id": 1, "q": [q05, q25, q50, q75, q95]}, ...]}.
+Outside the grader, MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR stand in
+for /input and /output.
 """
 
 import json
@@ -59,188 +56,208 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# The grader's -P leaves /bot off sys.path: put it back first.
+# The grader's -P keeps this file's directory off sys.path; restore it.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+IN_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
+OUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.645, -0.674, 0, 0.674, 1.645]
+# Quantile levels, in the order each output row lists them.
+LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
+# Standard-normal quantiles at those levels.
+Z_SCORES = (-1.645, -0.674, 0.0, 0.674, 1.645)
+# Launch reference for the log-time clock.
+EPOCH = datetime(2026, 11, 19, tzinfo=timezone.utc)
 
-# Launch reference for the log-time clock (the house curve baseline's).
-LAUNCH = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
-
-# Random-walk spread, logit units per square-root day (house baseline).
-SIGMA_RW = 0.5
-# Damping on the extrapolated logit move (0.7 = trust the trend, but not fully).
-DAMP = 0.7
-# Recency weighting half-life for the trend fit, in hours.
-HALF_LIFE_H = 8.0
-# Fit window: last 24 hours of reads.
-WINDOW_H = 24.0
-# Dilution prior: when the history is flat and early (few tracked players),
-# the median is this fraction of the last rate (see docstring, point 5).
-DILUTION_FACTOR = 0.4
-DILUTION_MAX_PLAYERS = 10000
-# Spread cap, logit units.
-SPREAD_CAP = 3.0
+RW_SIGMA = 0.5          # random-walk spread, logit units per sqrt(day)
+DAMP = 0.7              # damping on the extrapolated logit move
+HALF_LIFE_H = 8.0       # recency-weight half-life for the trend fit
+WINDOW_H = 24.0         # trend fit window, hours back from last read
+DILUTION = 0.4          # flat-early median as a fraction of last rate
+DILUTION_PLAYERS = 10000  # dilution prior only below this player count
+SPREAD_CAP = 3.0        # spread cap, logit units
+LO = 0.01               # rate clamp bounds, percent
+HI = 99.99
 
 
-def clamp_rate(x: float) -> float:
-    return min(99.99, max(0.01, x))
+def clamp_pct(rate):
+    """Clamp a percent into the range the logit is defined on."""
+    return HI if rate > HI else LO if rate < LO else rate
 
 
-def logit(pct: float) -> float:
-    p = clamp_rate(pct) / 100.0
+def to_logit(rate):
+    p = clamp_pct(rate) / 100.0
     return math.log(p / (1.0 - p))
 
 
-def sigmoid(lg: float) -> float:
-    if lg >= 0:
-        return 1.0 / (1.0 + math.exp(-lg))
-    e = math.exp(lg)
-    return e / (1.0 + e)
+def from_logit(lg):
+    """Logit back to a percent, numerically safe for large |lg|."""
+    if lg >= 0.0:
+        p = 1.0 / (1.0 + math.exp(-lg))
+    else:
+        e = math.exp(lg)
+        p = e / (1.0 + e)
+    return 100.0 * p
 
 
-def round4(x: float):
-    """x rounded to 4 decimals, half up (as JavaScript Math.round does it)."""
-    scaled = x * 10000
+def round4(value):
+    """Round to 4 decimals, half up (JavaScript Math.round semantics).
+
+    Whole numbers come back as int, so json writes 100, not 100.0.
+    """
+    scaled = value * 10000.0
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
         whole += 1
-    value = whole / 10000
-    return int(value) if value.is_integer() else value
+    rounded = whole / 10000.0
+    return int(rounded) if rounded.is_integer() else rounded
 
 
-def parse_time(s: str) -> datetime:
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+def parse_ts(text):
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def log_time(t: datetime) -> float:
-    """ln(1 + hours since launch). Negative hours clamp to 0."""
-    hours = (t - LAUNCH).total_seconds() / 3600.0
-    return math.log1p(max(0.0, hours))
+def log_clock(moment):
+    """ln(1 + hours since launch); reads before launch count as hour 0."""
+    hours = (moment - EPOCH).total_seconds() / 3600.0
+    return math.log1p(hours if hours > 0.0 else 0.0)
 
 
-def weighted_line(xs, ys, ws):
-    """Weighted least squares y = a + b*x. Returns (a, b, rmse)."""
-    sw = sum(ws)
-    if sw <= 0:
+def weighted_fit(xs, ys, ws):
+    """Weighted least squares for y = intercept + slope * x.
+
+    Returns (intercept, slope, rmse), or None when the weights sum to
+    nothing. A zero-variance x collapses to a flat line at the
+    weighted mean, with zero residual.
+    """
+    total_w = sum(ws)
+    if total_w <= 0.0:
         return None
-    mx = sum(w * x for x, w in zip(xs, ws)) / sw
-    my = sum(w * y for _, y, w in zip(xs, ys, ws)) / sw
-    sxx = sum(w * (x - mx) ** 2 for x, w in zip(xs, ws))
+    x_bar = sum(w * x for x, w in zip(xs, ws)) / total_w
+    y_bar = sum(w * y for y, w in zip(ys, ws)) / total_w
+    sxx = sum(w * (x - x_bar) ** 2 for x, w in zip(xs, ws))
     if sxx <= 1e-12:
-        return (my, 0.0, 0.0)
-    sxy = sum(w * (x - mx) * (y - my) for x, y, w in zip(xs, ys, ws))
-    b = sxy / sxx
-    a = my - b * mx
-    resid = [y - (a + b * x) for x, y in zip(xs, ys)]
-    rmse = math.sqrt(sum(w * r * r for r, w in zip(resid, ws)) / sw)
-    return (a, b, rmse)
+        return (y_bar, 0.0, 0.0)
+    sxy = sum(w * (x - x_bar) * (y - y_bar) for x, y, w in zip(xs, ys, ws))
+    slope = sxy / sxx
+    intercept = y_bar - slope * x_bar
+    sq = sum(w * (y - (intercept + slope * x)) ** 2 for x, y, w in zip(xs, ys, ws))
+    return (intercept, slope, math.sqrt(sq / total_w))
 
 
-def forecast_trophy(series, horizon_days, target_dt):
-    """series: list of (datetime, rate_or_None, players_tracked).
-    Returns the five quantiles (percent) for this trophy."""
-    # Keep only reads with a rate, oldest first.
-    pts = [(t, r) for (t, r, _n) in series if r is not None]
-    if not pts:
-        # No data at all: centre on 1% with a wide spread.
-        med_logit = logit(1.0)
-        spread = SIGMA_RW * math.sqrt(max(horizon_days, 0.0)) + 0.5
-        return quantiles(med_logit, min(spread, SPREAD_CAP))
-    last_t, last_rate = pts[-1]
-    last_logit = logit(last_rate)
-    n_players = series[-1][2] if series[-1][2] is not None else 0
+def make_quantiles(median_logit, spread):
+    """Five percent quantiles around a median logit, non-decreasing."""
+    qs = []
+    for z in Z_SCORES:
+        q = from_logit(median_logit + z * spread)
+        qs.append(round4(min(100.0, max(0.0, q))))
+    for i in range(1, len(qs)):
+        if qs[i] < qs[i - 1]:
+            qs[i] = qs[i - 1]
+    return qs
 
-    # Flat history (or too few reads): no trend to fit.
-    rates = [r for (_t, r) in pts]
-    if len(pts) < 3 or len(set(rates)) == 1:
-        med_rate = last_rate
-        if n_players and n_players < DILUTION_MAX_PLAYERS and last_rate < 99.0:
-            # Early, flat, pre-refresh: anticipate the dilution drop.
-            med_rate = clamp_rate(last_rate * DILUTION_FACTOR)
-        med_logit = logit(med_rate)
-        spread = SIGMA_RW * math.sqrt(max(horizon_days, 0.0))
-        # The dilution prior is a guess: widen the spread for it.
-        if med_rate != last_rate:
-            spread = math.sqrt(spread ** 2 + 0.6 ** 2)
-        return quantiles(med_logit, min(spread, SPREAD_CAP))
 
-    # Trend fit: last 24 h of reads, logit vs log-time, recency-weighted.
+def predict_trophy(reads, players_last, horizon_days, target):
+    """Forecast one trophy.
+
+    reads: [(datetime, rate or None)] oldest first.
+    players_last: players_tracked of the case's last read (or None).
+    horizon_days: days from the last read to the target (at least the
+    case's stated horizon).
+    Returns the five quantiles, in percent.
+    """
+    observed = [(t, r) for (t, r) in reads if r is not None]
+    walk = RW_SIGMA * math.sqrt(horizon_days if horizon_days > 0.0 else 0.0)
+    if not observed:
+        # No rate ever seen: centre on 1% with a wide band.
+        return make_quantiles(to_logit(1.0), min(walk + 0.5, SPREAD_CAP))
+
+    last_t, last_rate = observed[-1]
+    last_logit = to_logit(last_rate)
+    distinct_rates = {r for (_t, r) in observed}
+
+    if len(observed) < 3 or len(distinct_rates) == 1:
+        # No trend to fit: persist, with the dilution prior when the
+        # history is flat and the page is still pre-refresh.
+        median_rate = last_rate
+        widened = walk
+        if (
+            players_last
+            and players_last < DILUTION_PLAYERS
+            and last_rate < 99.0
+        ):
+            median_rate = clamp_pct(last_rate * DILUTION)
+            # The prior is a guess, so widen the band for it.
+            widened = math.sqrt(walk * walk + 0.6 * 0.6)
+        return make_quantiles(to_logit(median_rate), min(widened, SPREAD_CAP))
+
+    # Trend path: last 24 h of reads (falling back to all of them if
+    # that window holds too few), logit vs log-time, recency-weighted.
     cutoff = last_t.timestamp() - WINDOW_H * 3600.0
-    win = [(t, r) for (t, r) in pts if t.timestamp() >= cutoff]
-    if len(win) < 3:
-        win = pts
-    xs = [log_time(t) for (t, _r) in win]
-    ys = [logit(r) for (_t, r) in win]
-    # Exponential recency weights, half-life 8 h, anchored at the last read.
-    ws = [0.5 ** ((last_t - t).total_seconds() / 3600.0 / HALF_LIFE_H) for (t, _r) in win]
-    fit = weighted_line(xs, ys, ws)
+    window = [(t, r) for (t, r) in observed if t.timestamp() >= cutoff]
+    if len(window) < 3:
+        window = observed
+    xs = [log_clock(t) for (t, _r) in window]
+    ys = [to_logit(r) for (_t, r) in window]
+    ws = [
+        0.5 ** ((last_t - t).total_seconds() / 3600.0 / HALF_LIFE_H)
+        for (t, _r) in window
+    ]
+    fit = weighted_fit(xs, ys, ws)
     if fit is None:
-        return quantiles(last_logit, SIGMA_RW * math.sqrt(max(horizon_days, 0.0)))
-    _a, b, rmse = fit
+        return make_quantiles(last_logit, min(walk, SPREAD_CAP))
+    _intercept, slope, rmse = fit
 
-    # Extrapolate from the last observed logit, damped.
-    x_target = log_time(target_dt)
-    x_last = log_time(last_t)
-    move = b * max(0.0, x_target - x_last) * DAMP
-    med_logit = last_logit + move
-    # Clamp the median to the valid logit range.
-    med_logit = max(logit(0.01), min(logit(99.99), med_logit))
+    # Extrapolate from the last observed logit, damped, and keep the
+    # median inside the logit range the clamp allows.
+    ahead = log_clock(target) - log_clock(last_t)
+    move = slope * (ahead if ahead > 0.0 else 0.0) * DAMP
+    median_logit = last_logit + move
+    median_logit = max(to_logit(LO), min(to_logit(HI), median_logit))
 
-    # Spread: random walk + fit residual + trend uncertainty, in quadrature.
-    rw = SIGMA_RW * math.sqrt(max(horizon_days, 0.0))
-    trend_unc = 0.3 * abs(move)
-    spread = math.sqrt(rw ** 2 + rmse ** 2 + trend_unc ** 2)
-    return quantiles(med_logit, min(spread, SPREAD_CAP))
+    # Spread: random walk + fit residual + trend uncertainty.
+    spread = math.sqrt(walk ** 2 + rmse ** 2 + (0.3 * abs(move)) ** 2)
+    return make_quantiles(median_logit, min(spread, SPREAD_CAP))
 
 
-def quantiles(med_logit: float, spread: float):
-    out = []
-    for z in Z:
-        q = 100.0 * sigmoid(med_logit + z * spread)
-        q = min(100.0, max(0.0, q))
-        out.append(round4(q))
-    # Guarantee non-decreasing after rounding.
-    for i in range(1, len(out)):
-        if out[i] < out[i - 1]:
-            out[i] = out[i - 1]
-    return out
-
-
-def forecast_case(case: dict, name: str) -> dict:
-    if case["levels"] != LEVELS:
-        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
+def forecast_case(case, label):
+    if list(case["levels"]) != list(LEVELS):
+        raise ValueError(f"{label}: levels {case['levels']} != {LEVELS}")
     if not case["history"]:
-        raise ValueError(f"{name} has no history")
-    target_dt = parse_time(case["target"])
-    last_at = parse_time(case["history"][-1]["at"])
-    horizon_days = max(0.0, (target_dt - last_at).total_seconds() / 86400.0)
-    # Also honour the case's stated horizon if it is longer (deadline -> target).
+        raise ValueError(f"{label}: empty history")
+    target = parse_ts(case["target"])
+    last_read = case["history"][-1]
+    last_at = parse_ts(last_read["at"])
+    horizon_days = (target - last_at).total_seconds() / 86400.0
     stated = case.get("horizon_minutes")
     if stated is not None:
         horizon_days = max(horizon_days, stated / 1440.0)
+    horizon_days = max(0.0, horizon_days)
 
     rows = []
-    for i, trophy in enumerate(case["trophies"]):
-        series = []
+    for idx, trophy in enumerate(case["trophies"]):
+        reads = []
         for read in case["history"]:
             rates = read.get("rates") or []
-            rate = rates[i] if i < len(rates) else None
-            series.append((parse_time(read["at"]), rate, read.get("players_tracked")))
-        rows.append({"id": trophy["id"], "q": forecast_trophy(series, horizon_days, target_dt)})
+            rate = rates[idx] if idx < len(rates) else None
+            reads.append((parse_ts(read["at"]), rate))
+        rows.append(
+            {
+                "id": trophy["id"],
+                "q": predict_trophy(
+                    reads, last_read.get("players_tracked"), horizon_days, target
+                ),
+            }
+        )
     return {"trophies": rows}
 
 
-def main() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for path in sorted(INPUT_DIR.glob("*.in")):
+def main():
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    for path in sorted(IN_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
         forecast = forecast_case(case, path.name)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(
+        (OUT_DIR / f"{path.stem}.out").write_text(
             json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8"
         )
 
